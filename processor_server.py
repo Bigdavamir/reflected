@@ -1542,8 +1542,14 @@ async def process_single_request(item: RequestItem):
         if 'application/x-www-form-urlencoded' in content_type:
             try:
                 body_str = item.body.decode('utf-8', 'ignore')
-                body_params = parse_qs(body_str)
-                params_from_request_keys.update(body_params.keys())
+                # Manual parsing to preserve original encoded parameter names
+                for param_pair in body_str.split('&'):
+                    if '=' in param_pair:
+                        key = param_pair.split('=', 1)[0]
+                        # We add the RAW, undecoded key to preserve its exact structure.
+                        # The discovery functions are designed to handle both raw and
+                        # decoded forms for matching.
+                        params_from_request_keys.add(key)
             except Exception as e:
                 console_logger.error(f"    {C_RED}[!] Error parsing urlencoded POST body: {e}{C_END}")
         
@@ -1621,22 +1627,46 @@ async def process_single_request(item: RequestItem):
         console_logger.info(f"  {C_YELLOW}[Canary Test SKIP] Not enough parameters ({len(all_candidate_params)}/40 required). Using standard baseline.{C_END}")
         baseline_count = await establish_reflection_baseline(base_url, forwarded_headers)
 
-    # ========== Phase 2: Test ALL candidate parameters sequentially ==========
+    # Phase 2.1: Prioritize parameters from the original request and response
     if not all_reflected_params:
-        console_logger.info(f"  {C_BLUE}[*] Phase 2: Sequentially testing all {len(all_candidate_params)} candidate parameters...{C_END}")
-        
-        # Use the more reliable sequential discovery method
-        all_reflected_params = await run_sequential_discovery(
+        params_from_context = list(params_from_request.union(params_from_response))
+        if params_from_context:
+            console_logger.info(f"  {C_BLUE}[*] Phase 2.1: Sequentially testing {len(params_from_context)} parameters from request/response...{C_END}")
+
+            # Use the more reliable sequential discovery for these high-priority params
+            request_reflected_params = await run_sequential_discovery(
+                full_url=item.url,
+                method=item.method,
+                headers=forwarded_headers,
+                original_body_bytes=item.body,
+                baseline_count=baseline_count,
+                params_to_test=params_from_context
+            )
+
+            if request_reflected_params:
+                console_logger.info(f"    {C_GREEN}[SUCCESS] Found {len(request_reflected_params)} reflected parameters from request: {', '.join(sorted(list(request_reflected_params)))}{C_END}")
+                all_reflected_params.update(request_reflected_params)
+
+    # Phase 2.2: Discover additional parameters using the wordlist
+    params_to_bruteforce = [p for p in PARAMS_TO_TEST if p not in all_reflected_params]
+    if params_to_bruteforce:
+        console_logger.info(f"  {C_BLUE}[*] Phase 2.2: Batch testing {len(params_to_bruteforce)} parameters from wordlist...{C_END}")
+
+        # Use the batched discovery (with retries) for the larger wordlist
+        wordlist_reflected_params = await run_batched_discovery_with_retry(
             full_url=item.url,
             method=item.method,
             headers=forwarded_headers,
             original_body_bytes=item.body,
             baseline_count=baseline_count,
-            params_to_test=all_candidate_params
+            params_to_test=params_to_bruteforce
         )
-        
-        if all_reflected_params:
-            console_logger.info(f"    {C_GREEN}[SUCCESS] Found {len(all_reflected_params)} reflected parameters: {', '.join(sorted(list(all_reflected_params)))}{C_END}")
+
+        if wordlist_reflected_params:
+            # Convert list to set for update operation
+            wordlist_param_set = set(wordlist_reflected_params)
+            console_logger.info(f"    {C_GREEN}[SUCCESS] Found {len(wordlist_param_set)} additional reflected parameters from wordlist.{C_END}")
+            all_reflected_params.update(wordlist_param_set)
 
     # Final Check and Continuation
     if not all_reflected_params:
