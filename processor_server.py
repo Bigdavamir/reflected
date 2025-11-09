@@ -435,107 +435,60 @@ def is_reflection_in_unsafe_context(text: str, marker_start: str, marker_end: st
         return full_marker_string in html.unescape(text)
 
 
-async def establish_reflection_baseline_v2(
+async def establish_reflection_baseline(
     full_url: str,
     method: str,
     headers: Dict,
     original_body_bytes: bytes
 ) -> int:
     """
-    Phase 1: Establish reflection baseline based on request method and content type.
-    
-    Scenarios:
-    1. GET with params -> Add random param to existing query
-    2. GET without params -> Add random param as first query param
-    3. POST urlencoded -> Add random param to body
-    4. POST multipart -> Add random field to multipart body
-    
-    Returns: baseline reflection count (how many times random value appears)
+    Establishes a reflection baseline by sending multiple random parameters and finding the most common reflection count.
+    This helps filter out "background noise" where frameworks might reflect all parameters a certain number of times.
     """
-    console_logger.info(f"  {C_CYAN}[Phase 1] Establishing reflection baseline for {method}...{C_END}")
-    
-    random_param = generate_random_string(8)
-    random_value = generate_random_string(12)
-    
+    console_logger.info(f"  {C_CYAN}[Phase 1] Establishing reflection baseline...{C_END}")
+
+    num_probes = 5
+    probe_params = {generate_random_string(8): generate_random_string(12) for _ in range(num_probes)}
+
     parsed_url = urlparse(full_url)
     base_path = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-    
     content_type = next((v for k, v in headers.items() if k.lower() == 'content-type'), "").lower()
-    
+
     request_url = base_path
     request_data = None
     test_headers = headers.copy()
     test_headers.pop('Content-Length', None)
     test_headers.pop('content-length', None)
-    
-    # === SCENARIO: GET REQUEST ===
+
+    # Build the request with all probe parameters
     if method.upper() == "GET":
         existing_params = parse_qs(parsed_url.query, keep_blank_values=True)
-        
-        if existing_params:
-            # GET with existing params
-            console_logger.info(f"    {C_BLUE}[Phase 1] GET request with existing params detected{C_END}")
-            existing_params[random_param] = [random_value]
-        else:
-            # GET without params
-            console_logger.info(f"    {C_BLUE}[Phase 1] GET request without params detected{C_END}")
-            existing_params = {random_param: [random_value]}
-        
+        for key, value in probe_params.items():
+            existing_params[key] = [value]
         request_url = f"{base_path}?{urlencode(existing_params, doseq=True)}"
-    
-    # === SCENARIO: POST REQUEST ===
+
     elif method.upper() == "POST":
-        # Parse existing query params (keep them in URL)
         existing_query_params = parse_qs(parsed_url.query, keep_blank_values=True)
         if existing_query_params:
             request_url = f"{base_path}?{urlencode(existing_query_params, doseq=True)}"
-        
-        # --- POST urlencoded ---
+
         if 'application/x-www-form-urlencoded' in content_type:
-            console_logger.info(f"    {C_BLUE}[Phase 1] POST urlencoded detected{C_END}")
-            
             try:
                 body_dict = dict(parse_qsl(original_body_bytes.decode('utf-8', errors='ignore')))
             except Exception:
                 body_dict = {}
-            
-            # Add random param to body
-            body_dict[random_param] = random_value
+
+            for key, value in probe_params.items():
+                body_dict[key] = value
             request_data = urlencode(body_dict).encode('utf-8')
-        
-        # --- POST multipart ---
-        elif 'multipart/form-data' in content_type:
-            console_logger.info(f"    {C_BLUE}[Phase 1] POST multipart detected{C_END}")
-            
-            # Extract boundary from Content-Type
-            boundary_match = re.search(r'boundary=([^;]+)', content_type)
-            if boundary_match:
-                boundary = boundary_match.group(1).strip('"')
-            else:
-                boundary = generate_random_string(16)
-            
-            # Build new multipart body with random field
-            multipart_body = original_body_bytes.decode('utf-8', errors='ignore')
-            
-            # Add random field before final boundary
-            new_field = f"--{boundary}\r\n"
-            new_field += f'Content-Disposition: form-data; name="{random_param}"\r\n\r\n'
-            new_field += f"{random_value}\r\n"
-            
-            # Insert before final boundary
-            final_boundary = f"--{boundary}--"
-            if final_boundary in multipart_body:
-                multipart_body = multipart_body.replace(final_boundary, new_field + final_boundary)
-            else:
-                # If no final boundary found, append it
-                multipart_body += new_field + final_boundary
-            
-            request_data = multipart_body.encode('utf-8')
-            test_headers['Content-Type'] = f'multipart/form-data; boundary={boundary}'
-    
-    # === MAKE REQUEST ===
-    console_logger.info(f"    {C_YELLOW}[Phase 1] Testing with random param: {random_param}={random_value}{C_END}")
-    
+        else: # Default to query params for other POST types if body is not urlencoded
+            existing_params = parse_qs(parsed_url.query, keep_blank_values=True)
+            for key, value in probe_params.items():
+                existing_params[key] = [value]
+            request_url = f"{base_path}?{urlencode(existing_params, doseq=True)}"
+
+
+    # Make the request
     response = await make_request_with_retries(
         target_url=request_url,
         headers=test_headers,
@@ -543,17 +496,25 @@ async def establish_reflection_baseline_v2(
         method=method,
         data=request_data
     )
-    
-    if response:
-        # Count occurrences in unescaped response
-        response_text = html.unescape(response.text)
-        count = response_text.count(random_value)
-        
-        console_logger.info(f"  {C_GREEN}[Phase 1] Baseline reflection count: {count}{C_END}")
-        return count
-    
-    console_logger.warning(f"  {C_YELLOW}[Phase 1] Failed to establish baseline. Assuming 0.{C_END}")
-    return 0
+
+    if not response:
+        console_logger.warning(f"  {C_YELLOW}[Phase 1] Failed to establish baseline. Assuming 0.{C_END}")
+        return 0
+
+    # Calculate the baseline from the response
+    from collections import Counter
+    response_text = html.unescape(response.text)
+    counts = [response_text.count(marker) for marker in probe_params.values()]
+
+    if not counts:
+        return 0
+
+    # Find the most common count
+    count_freq = Counter(counts)
+    most_common_count = count_freq.most_common(1)[0][0]
+
+    console_logger.info(f"  {C_GREEN}[Phase 1] Reflection counts: {counts}. Most common is {most_common_count}. Baseline set to: {most_common_count}{C_END}")
+    return most_common_count
 
 
 # REPLACE your entire run_batched_discovery function with this new version
@@ -1592,63 +1553,33 @@ async def process_single_request(item: RequestItem):
     
     params_from_request = params_from_request_keys
     
-    # Prepare all candidate parameters for canary test
-    all_candidate_params = list(
-        set(PARAMS_TO_TEST)
-        .union(params_from_response)
-        .union(params_from_request_keys)
+    # Phase 1: Establish a reliable reflection baseline.
+    baseline_count = await establish_reflection_baseline(
+        full_url=item.url,
+        method=item.method,
+        headers=forwarded_headers,
+        original_body_bytes=item.body
     )
-    
+
     all_reflected_params = set()
-    baseline_count = 0
-    has_global_reflection = False
-    
-    # Run Canary Test if we have enough parameters
-    if len(all_candidate_params) >= 40:
-        console_logger.info(f"  {C_MAGENTA}[*] Phase 1: Running Canary Test with {len(all_candidate_params)} candidate parameters...{C_END}")
-        global_baseline, canary_reflected_params = await run_canary_global_reflection_test(
-            base_url=base_url,
-            headers=forwarded_headers,
-            params_to_test=all_candidate_params
-        )
-        
-        if global_baseline > 0 and not canary_reflected_params:
-            has_global_reflection = True
-            console_logger.warning(f"  {C_RED}[⚠️  GLOBAL REFLECTION DETECTED] All tested parameters reflected equally (baseline: {global_baseline}).{C_END}")
-            console_logger.warning(f"  {C_RED}[⚠️  FALSE POSITIVE] This appears to be template/framework reflection, NOT user-controlled XSS!{C_END}")
-            console_logger.info(f"  {C_YELLOW}[→] Stopping further analysis for this target.{C_END}")
-            return
-        
-        if canary_reflected_params:
-            console_logger.info(f"  {C_GREEN}[✓ Canary SUCCESS] Found {len(canary_reflected_params)} truly reflected parameters (MORE than global baseline of {global_baseline})!{C_END}")
-            all_reflected_params = canary_reflected_params
-            baseline_count = global_baseline
-        else:
-            console_logger.info(f"  {C_YELLOW}[Canary Test] No reflections detected (baseline: {global_baseline}). Proceeding with standard discovery...{C_END}")
-            baseline_count = global_baseline
-    else:
-        console_logger.info(f"  {C_YELLOW}[Canary Test SKIP] Not enough parameters ({len(all_candidate_params)}/40 required). Using standard baseline.{C_END}")
-        baseline_count = await establish_reflection_baseline(base_url, forwarded_headers)
 
     # Phase 2.1: Prioritize parameters from the original request and response
-    if not all_reflected_params:
-        params_from_context = list(params_from_request.union(params_from_response))
-        if params_from_context:
-            console_logger.info(f"  {C_BLUE}[*] Phase 2.1: Sequentially testing {len(params_from_context)} parameters from request/response...{C_END}")
+    params_from_context = list(params_from_request.union(params_from_response))
+    if params_from_context:
+        console_logger.info(f"  {C_BLUE}[*] Phase 2.1: Sequentially testing {len(params_from_context)} parameters from request/response...{C_END}")
 
-            # Use the more reliable sequential discovery for these high-priority params
-            request_reflected_params = await run_sequential_discovery(
-                full_url=item.url,
-                method=item.method,
-                headers=forwarded_headers,
-                original_body_bytes=item.body,
-                baseline_count=baseline_count,
-                params_to_test=params_from_context
-            )
+        request_reflected_params = await run_sequential_discovery(
+            full_url=item.url,
+            method=item.method,
+            headers=forwarded_headers,
+            original_body_bytes=item.body,
+            baseline_count=baseline_count,
+            params_to_test=params_from_context
+        )
 
-            if request_reflected_params:
-                console_logger.info(f"    {C_GREEN}[SUCCESS] Found {len(request_reflected_params)} reflected parameters from request: {', '.join(sorted(list(request_reflected_params)))}{C_END}")
-                all_reflected_params.update(request_reflected_params)
+        if request_reflected_params:
+            console_logger.info(f"    {C_GREEN}[SUCCESS] Found {len(request_reflected_params)} reflected parameters from request: {', '.join(sorted(list(request_reflected_params)))}{C_END}")
+            all_reflected_params.update(request_reflected_params)
 
     # Phase 2.2: Discover additional parameters using the wordlist
     params_to_bruteforce = [p for p in PARAMS_TO_TEST if p not in all_reflected_params]
