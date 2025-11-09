@@ -14,6 +14,7 @@ import sys
 import re
 import base64
 import binascii
+import math
 import time
 import html
 import cgi
@@ -51,14 +52,14 @@ FLAREPROX_WORKERS = [
 ]
 
 # Add these new constants near the top of your processor_server.py file
-DELAY_BETWEEN_BATCHES = 1.0       # Increase to 1 second for safety
-DELAY_BETWEEN_CONFIRMATIONS = 0.5 # Increase to 0.5 seconds for safety
+DELAY_BETWEEN_BATCHES = 2.0       # Increase to 1 second for safety
+DELAY_BETWEEN_CONFIRMATIONS = 1.5 # Increase to 0.5 seconds for safety
 DELAY_BETWEEN_PROBES = 0.3
 
 
 HEADER_BLACKLIST = {'host', 'content-length', 'connection'}
 DISCOVERY_BATCH_SIZE = 40
-MAX_RETRIES = 5
+MAX_RETRIES = 30
 PROBE_CHARS = ['<', '>', '"', "'"]
 
 ENCODING_MAP = {
@@ -144,44 +145,232 @@ marker_start = generate_natural_marker("val")  # مثلاً: val123456
 marker_end = generate_natural_marker("end")    # مثلاً: end789012
 
 
-async def make_request_with_retries(target_url: str, headers: Dict, log_prefix: str, method: str = "GET", data=None, files=None) -> Optional[httpx.Response]:
-    for attempt in range(MAX_RETRIES):
-        worker = get_flareprox_worker()
+# ========================================
+# STEP 1: اضافه کردن Global State Tracking
+# ========================================
+
+# ========================================
+# Global Tracking Variables
+# ========================================
+FAILED_WORKERS_BY_DOMAIN: DefaultDict[str, Set[str]] = defaultdict(set)
+GLOBAL_WORKER_HEALTH: DefaultDict[str, int] = defaultdict(lambda: 10)  # Default score: 10
+
+
+def get_best_worker_for_domain(domain: str, exclude_workers: Optional[Set[str]] = None) -> Optional[str]:
+    """
+    انتخاب بهترین worker برای یک domain خاص
+    - Worker هایی که برای این domain fail شدن رو exclude میکنه
+    - Worker هایی که health score بالاتری دارن رو ترجیح میده
+    """
+    if exclude_workers is None:
+        exclude_workers = set()
+    
+    # Worker های قابل استفاده
+    failed_for_domain = FAILED_WORKERS_BY_DOMAIN.get(domain, set())
+    available_workers = [
+        w for w in FLAREPROX_WORKERS 
+        if w not in exclude_workers and w not in failed_for_domain
+    ]
+    
+    if not available_workers:
+        # اگه همه fail شدن، از همه استفاده کن (شاید الان درست شده باشن)
+        console_logger.warning(f"{C_YELLOW}[!] All workers marked as failed for {domain}. Trying all again.{C_END}")
+        available_workers = [w for w in FLAREPROX_WORKERS if w not in exclude_workers]
+    
+    if not available_workers:
+        return None
+    
+    # Sort کن بر اساس health score (بهترین worker رو برگردون)
+    sorted_workers = sorted(available_workers, key=lambda w: GLOBAL_WORKER_HEALTH.get(w, 0), reverse=True)
+    return sorted_workers[0]
+
+
+def mark_worker_failed(worker: str, domain: str):
+    """Worker رو برای این domain به عنوان failed علامت بزن"""
+    FAILED_WORKERS_BY_DOMAIN[domain].add(worker)
+    GLOBAL_WORKER_HEALTH[worker] -= 10  # کاهش score
+    
+    # محدود کردن به حداقل -20
+    if GLOBAL_WORKER_HEALTH[worker] < -20:
+        GLOBAL_WORKER_HEALTH[worker] = -20
+    
+    worker_short = worker.split('/')[-1][:20]
+    console_logger.debug(
+        f"{C_RED}[Worker Health] {worker_short}... marked as failed for {domain} "
+        f"(Score: {GLOBAL_WORKER_HEALTH[worker]}){C_END}"
+    )
+
+
+def mark_worker_success(worker: str):
+    """Worker موفق بود، score رو افزایش بده"""
+    GLOBAL_WORKER_HEALTH[worker] += 1
+    if GLOBAL_WORKER_HEALTH[worker] > 50:  # Cap at 50
+        GLOBAL_WORKER_HEALTH[worker] = 50
+
+
+# ========================================
+# ENHANCED make_request_with_retries با Smart Worker Rotation
+# ========================================
+
+async def make_request_with_retries(
+    target_url: str, 
+    headers: Dict, 
+    log_prefix: str, 
+    method: str = "GET", 
+    data=None, 
+    files=None,
+    max_retries: Optional[int] = None
+) -> Optional[httpx.Response]:
+    """
+    ✅ ENHANCED VERSION با Smart Worker Rotation
+    - هر retry از worker متفاوت استفاده میکنه
+    - Worker های fail شده رو track میکنه
+    """
+    if max_retries is None:
+        max_retries = MAX_RETRIES
+    
+    parsed = urlparse(target_url)
+    domain = parsed.netloc
+    
+    used_workers_this_request: Set[str] = set()
+    
+    for attempt in range(max_retries):
+        # ✅ انتخاب worker بر اساس domain و worker های قبلی
+        worker = get_best_worker_for_domain(domain, exclude_workers=used_workers_this_request)
+        
         if not worker:
-            console_logger.error(f"  {C_RED}{log_prefix} FlareProx worker list is empty.{C_END}")
+            console_logger.error(f"{C_RED}{log_prefix} No available workers left.{C_END}")
             return None
         
-        # Construct the final URL for FlareProx
+        used_workers_this_request.add(worker)
+        worker_name = worker.split('/')[-1][:20]
+        
         final_url = f"{worker}?url={quote(target_url)}"
-
-        # Prepare headers for the request
         req_headers = headers.copy()
-
-        # For multipart file uploads, httpx prefers to set its own Content-Type with the correct boundary.
-        # If we are using the 'files' parameter, we should remove any pre-existing Content-Type.
+        
+        # Remove Content-Type for multipart (httpx handles it)
         if files:
             req_headers.pop('Content-Type', None)
             req_headers.pop('content-type', None)
-
-        # For standard POST data, if a Content-Type isn't already specified, default to urlencoded.
-        # This is the key change: we no longer blindly overwrite the Content-Type.
         elif data and not files and 'content-type' not in (k.lower() for k in req_headers):
             req_headers['Content-Type'] = 'application/x-www-form-urlencoded'
-
+        
         try:
             async with httpx.AsyncClient(verify=False, timeout=15, follow_redirects=True) as client:
                 req = client.build_request(method.upper(), final_url, headers=req_headers, data=data, files=files)
                 response = await client.send(req)
+                
+                # ✅ اگه 403 یا 429 بود، این worker رو برای این domain failed علامت بزن
+                if response.status_code in [403, 429]:
+                    mark_worker_failed(worker, domain)
+                    
+                    if attempt < max_retries - 1:
+                        console_logger.warning(
+                            f"{C_YELLOW}{log_prefix} Worker '{worker_name}...' blocked (Status: {response.status_code}). "
+                            f"Retrying with different worker ({attempt+1}/{max_retries})...{C_END}"
+                        )
+                        await asyncio.sleep(1.0 + (attempt * 0.5))  # Exponential backoff
+                        continue
+                    else:
+                        console_logger.error(
+                            f"{C_RED}{log_prefix} All retries exhausted (Status: {response.status_code}). Giving up.{C_END}"
+                        )
+                        return None
+                
+                # ✅ Status code های دیگه
                 response.raise_for_status()
+                
+                # ✅ موفق بود! score رو افزایش بده
+                mark_worker_success(worker)
                 return response
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            error_type = type(e).__name__
-            status_code = f" (Status: {e.response.status_code})" if hasattr(e, 'response') and hasattr(e.response, 'status_code') else ""
-            if attempt < MAX_RETRIES - 1:
-                console_logger.debug(f"  {C_YELLOW}{log_prefix} Attempt {attempt + 1}/{MAX_RETRIES} failed: {error_type}{status_code}. Retrying...{C_END}")
+        
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code
+            
+            # اگه 403/429 بود، worker رو failed علامت بزن
+            if status_code in [403, 429]:
+                mark_worker_failed(worker, domain)
+            
+            if attempt < max_retries - 1:
+                console_logger.debug(
+                    f"{C_YELLOW}{log_prefix} Attempt {attempt+1}/{max_retries} with '{worker_name}...' "
+                    f"failed (Status: {status_code}). Retrying...{C_END}"
+                )
+                await asyncio.sleep(1.0 * (attempt + 1))
             else:
-                console_logger.error(f"  {C_RED}{log_prefix} Final attempt failed for {target_url}: {error_type}{status_code}. Giving up.{C_END}")
+                console_logger.error(
+                    f"{C_RED}{log_prefix} Final attempt failed for {target_url}: "
+                    f"HTTPStatusError (Status: {status_code}). Giving up.{C_END}"
+                )
+        
+        except httpx.RequestError as e:
+            error_type = type(e).__name__
+            mark_worker_failed(worker, domain)  # Network error = worker مشکل داره
+            
+            if attempt < max_retries - 1:
+                console_logger.debug(
+                    f"{C_YELLOW}{log_prefix} Network error with '{worker_name}...' ({error_type}). Retrying...{C_END}"
+                )
+                await asyncio.sleep(0.5)
+            else:
+                console_logger.error(
+                    f"{C_RED}{log_prefix} Final attempt failed: {error_type}. Giving up.{C_END}"
+                )
+    
     return None
+
+
+# ========================================
+# Batch-Level Retry Wrapper
+# ========================================
+
+async def run_batched_discovery_with_retry(
+    full_url: str,
+    method: str,
+    headers: Dict,
+    original_body_bytes: bytes,
+    baseline_count: int,
+    params_to_test: List[str],
+    max_batch_retries: int = 2
+) -> List[str]:  # ✅ FIXED: Return List instead of Set
+    """
+    ✅ Wrapper around run_batched_discovery که batch های fail شده رو retry میکنه
+    """
+    found_params: List[str] = []  # ✅ Use List to match run_batched_discovery return type
+    
+    for batch_attempt in range(max_batch_retries):
+        console_logger.info(
+            f"{C_CYAN}[Phase 2] Batch Discovery Attempt {batch_attempt+1}/{max_batch_retries}...{C_END}"
+        )
+        
+        # اجرای discovery اصلی
+        batch_results = await run_batched_discovery(
+            full_url=full_url,
+            method=method,
+            headers=headers,
+            original_body_bytes=original_body_bytes,
+            baseline_count=baseline_count,
+            params_to_test=params_to_test
+        )
+        
+        # ✅ Merge results (avoid duplicates)
+        for param in batch_results:
+            if param not in found_params:
+                found_params.append(param)
+        
+        # اگه چیزی پیدا شد یا آخرین attempt بود، متوقف شو
+        if batch_results or batch_attempt == max_batch_retries - 1:
+            break
+        
+        # اگه هیچی پیدا نشد، با تاخیر بیشتر دوباره امتحان کن
+        console_logger.warning(
+            f"{C_YELLOW}[Phase 2] No params found in attempt {batch_attempt+1}. "
+            f"Retrying with different workers...{C_END}"
+        )
+        await asyncio.sleep(2.0)
+    
+    return found_params
+
 
 
 
@@ -246,84 +435,188 @@ def is_reflection_in_unsafe_context(text: str, marker_start: str, marker_end: st
         return full_marker_string in html.unescape(text)
 
 
-async def establish_reflection_baseline(base_url: str, headers: Dict) -> int:
+async def establish_reflection_baseline_v2(
+    full_url: str,
+    method: str,
+    headers: Dict,
+    original_body_bytes: bytes
+) -> int:
     """
-    Sends a request with a random parameter and value to establish a baseline
-    for how many times a random string naturally appears in the response.
-    This helps filter out noise.
+    Phase 1: Establish reflection baseline based on request method and content type.
+    
+    Scenarios:
+    1. GET with params -> Add random param to existing query
+    2. GET without params -> Add random param as first query param
+    3. POST urlencoded -> Add random param to body
+    4. POST multipart -> Add random field to multipart body
+    
+    Returns: baseline reflection count (how many times random value appears)
     """
-    console_logger.info(f"  {C_CYAN}[Phase 1] Establishing reflection baseline...{C_END}")
+    console_logger.info(f"  {C_CYAN}[Phase 1] Establishing reflection baseline for {method}...{C_END}")
     
-    random_param = generate_random_string(6)
-    random_value = generate_random_string(10)
-    req_url = append_query(base_url, f"{random_param}={random_value}")
+    random_param = generate_random_string(8)
+    random_value = generate_random_string(12)
     
-    response = await make_request_with_retries(req_url, headers, "[Phase 1]")
+    parsed_url = urlparse(full_url)
+    base_path = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+    
+    content_type = next((v for k, v in headers.items() if k.lower() == 'content-type'), "").lower()
+    
+    request_url = base_path
+    request_data = None
+    test_headers = headers.copy()
+    test_headers.pop('Content-Length', None)
+    test_headers.pop('content-length', None)
+    
+    # === SCENARIO: GET REQUEST ===
+    if method.upper() == "GET":
+        existing_params = parse_qs(parsed_url.query, keep_blank_values=True)
+        
+        if existing_params:
+            # GET with existing params
+            console_logger.info(f"    {C_BLUE}[Phase 1] GET request with existing params detected{C_END}")
+            existing_params[random_param] = [random_value]
+        else:
+            # GET without params
+            console_logger.info(f"    {C_BLUE}[Phase 1] GET request without params detected{C_END}")
+            existing_params = {random_param: [random_value]}
+        
+        request_url = f"{base_path}?{urlencode(existing_params, doseq=True)}"
+    
+    # === SCENARIO: POST REQUEST ===
+    elif method.upper() == "POST":
+        # Parse existing query params (keep them in URL)
+        existing_query_params = parse_qs(parsed_url.query, keep_blank_values=True)
+        if existing_query_params:
+            request_url = f"{base_path}?{urlencode(existing_query_params, doseq=True)}"
+        
+        # --- POST urlencoded ---
+        if 'application/x-www-form-urlencoded' in content_type:
+            console_logger.info(f"    {C_BLUE}[Phase 1] POST urlencoded detected{C_END}")
+            
+            try:
+                body_dict = dict(parse_qsl(original_body_bytes.decode('utf-8', errors='ignore')))
+            except Exception:
+                body_dict = {}
+            
+            # Add random param to body
+            body_dict[random_param] = random_value
+            request_data = urlencode(body_dict).encode('utf-8')
+        
+        # --- POST multipart ---
+        elif 'multipart/form-data' in content_type:
+            console_logger.info(f"    {C_BLUE}[Phase 1] POST multipart detected{C_END}")
+            
+            # Extract boundary from Content-Type
+            boundary_match = re.search(r'boundary=([^;]+)', content_type)
+            if boundary_match:
+                boundary = boundary_match.group(1).strip('"')
+            else:
+                boundary = generate_random_string(16)
+            
+            # Build new multipart body with random field
+            multipart_body = original_body_bytes.decode('utf-8', errors='ignore')
+            
+            # Add random field before final boundary
+            new_field = f"--{boundary}\r\n"
+            new_field += f'Content-Disposition: form-data; name="{random_param}"\r\n\r\n'
+            new_field += f"{random_value}\r\n"
+            
+            # Insert before final boundary
+            final_boundary = f"--{boundary}--"
+            if final_boundary in multipart_body:
+                multipart_body = multipart_body.replace(final_boundary, new_field + final_boundary)
+            else:
+                # If no final boundary found, append it
+                multipart_body += new_field + final_boundary
+            
+            request_data = multipart_body.encode('utf-8')
+            test_headers['Content-Type'] = f'multipart/form-data; boundary={boundary}'
+    
+    # === MAKE REQUEST ===
+    console_logger.info(f"    {C_YELLOW}[Phase 1] Testing with random param: {random_param}={random_value}{C_END}")
+    
+    response = await make_request_with_retries(
+        target_url=request_url,
+        headers=test_headers,
+        log_prefix="[Phase 1 Baseline]",
+        method=method,
+        data=request_data
+    )
     
     if response:
-        # Count occurrences in the HTML-unescaped response text
-        count = html.unescape(response.text).count(random_value)
-        console_logger.info(f"  {C_BLUE}[Phase 1] Baseline reflection count is: {count}{C_END}")
-        return count
+        # Count occurrences in unescaped response
+        response_text = html.unescape(response.text)
+        count = response_text.count(random_value)
         
-    console_logger.warning(f"  {C_YELLOW}[Phase 1] Failed to establish a baseline. Assuming 0.{C_END}")
+        console_logger.info(f"  {C_GREEN}[Phase 1] Baseline reflection count: {count}{C_END}")
+        return count
+    
+    console_logger.warning(f"  {C_YELLOW}[Phase 1] Failed to establish baseline. Assuming 0.{C_END}")
     return 0
+
 
 # REPLACE your entire run_batched_discovery function with this new version
 
+
 async def run_batched_discovery(full_url: str, method: str, headers: Dict, original_body_bytes: bytes, baseline_count: int, params_to_test: List[str]) -> Set[str]:
-    # --- This initial setup remains unchanged ---
+    """
+    ✅ FINAL FIX: Preserves complex nested parameter structures like urls[0][longUrl]
+    by treating the body as a raw string and appending test params carefully.
+    """
     parsed_original_url = urlparse(full_url)
     base_path = f"{parsed_original_url.scheme}://{parsed_original_url.netloc}{parsed_original_url.path}"
     original_query_params = parse_qs(parsed_original_url.query, keep_blank_values=True)
-
-    console_logger.info(f"  {C_CYAN}[Phase 2] Running advanced batched discovery on {len(params_to_test)} params...{C_END}")
+    
+    console_logger.info(f"  {C_CYAN}[Phase 2] Running batched discovery on {len(params_to_test)} params...{C_END}")
     found_params = set()
     param_batches = list(get_batches(params_to_test, DISCOVERY_BATCH_SIZE))
     total_batches = len(param_batches)
     content_type = next((v for k, v in headers.items() if k.lower() == 'content-type'), "").lower()
-
+    
     for i, batch in enumerate(param_batches):
         log_prefix = f"[Phase 2 - Batch {i+1}/{total_batches}]"
-
-        # --- NEW LOGIC: Create a unique marker for EACH parameter in the batch ---
+        
+        # Create unique marker for EACH parameter
         param_marker_map = {param: generate_random_string(12) for param in batch}
-        # --------------------------------------------------------------------------
-
+        
         request_data = None
         current_headers = headers.copy()
-
-        # MODIFIED LOGIC: Build the request URL/body by adding the unique markers
+        
+        # Build query params with markers
         batch_query_params = original_query_params.copy()
-        # Add the unique markers to the query parameters
         for param, marker in param_marker_map.items():
             batch_query_params[param] = marker
-            
+        
         request_url = f"{base_path}?{urlencode(batch_query_params, doseq=True)}"
-
+        
         if method.upper() == "POST":
             current_headers.pop('Content-Length', None)
             current_headers.pop('content-length', None)
-
+            
             if 'application/x-www-form-urlencoded' in content_type:
+                # ✅ CRITICAL FIX: Preserve original body as raw string
                 try:
-                    body_dict = dict(parse_qsl(original_body_bytes.decode('utf-8', errors='ignore')))
-                except Exception:
-                    body_dict = {}
-                # Update body with the unique markers
-                body_dict.update(param_marker_map)
-                request_data = urlencode(body_dict).encode('utf-8')
+                    original_body_str = original_body_bytes.decode('utf-8', errors='ignore')
+                except:
+                    original_body_str = ""
+                
+                # Append test params to the end without parsing
+                appended_params = "&".join([f"{quote(param, safe='')}={quote(marker, safe='')}" for param, marker in param_marker_map.items()])
+                
+                if original_body_str:
+                    request_data = f"{original_body_str}&{appended_params}".encode('utf-8')
+                else:
+                    request_data = appended_params.encode('utf-8')
             
             elif 'multipart/form-data' in content_type:
                 patched_body = original_body_bytes
-                # Iteratively apply the patch for each parameter with its unique marker
                 for param, marker in param_marker_map.items():
                     pattern = re.compile(
                         b'(--[^\r\n]+\r\nContent-Disposition: form-data; name="' + re.escape(param.encode()) + b'".*?\r\n\r\n)'
                         b'(.*?)(?=\r\n--)',
                         re.DOTALL
                     )
-                    # We update patched_body in each iteration
                     patched_body = pattern.sub(b'\\1' + marker.encode(), patched_body, count=1)
                 request_data = patched_body
         
@@ -334,53 +627,59 @@ async def run_batched_discovery(full_url: str, method: str, headers: Dict, origi
             method=method,
             data=request_data
         )
-
+        
         if not response:
             await asyncio.sleep(DELAY_BETWEEN_BATCHES)
             continue
-
+        
         color = C_GREEN if response.status_code == 200 else C_YELLOW
-        console_logger.info(f"    {color}- Testing batch {i+1}/{total_batches} -> Status: {response.status_code}{C_END}")
-
-        # --- MODIFIED LOGIC: Check if ANY marker's reflection count exceeds the baseline ---
-        # This determines if the batch is worth inspecting further.
+        console_logger.info(f"    {color}- Batch {i+1}/{total_batches} -> Status: {response.status_code}{C_END}")
+        
+        # Check if batch is suspicious
         response_text_unescaped = html.unescape(response.text)
         is_batch_suspicious = any(response_text_unescaped.count(marker) > baseline_count for marker in param_marker_map.values())
-        # -----------------------------------------------------------------------------------
-
+        
         if is_batch_suspicious:
             console_logger.info(f"    {C_BLUE}- Batch {i+1} is suspicious. Confirming individually...{C_END}")
-            # --- This confirmation loop remains unchanged, providing a robust second layer of verification ---
+            
             for param in batch:
                 await asyncio.sleep(DELAY_BETWEEN_CONFIRMATIONS)
-
-                individual_marker = generate_random_string(12) # A fresh marker for confirmation
+                
+                individual_marker = generate_random_string(12)
                 confirm_data = None
                 confirm_headers = headers.copy()
                 confirm_headers.pop('Content-Length', None)
                 confirm_headers.pop('content-length', None)
-
+                
                 confirm_query_params = original_query_params.copy()
                 confirm_query_params[param] = individual_marker
                 confirm_url = f"{base_path}?{urlencode(confirm_query_params, doseq=True)}"
-
+                
                 if method.upper() == "POST":
                     if 'application/x-www-form-urlencoded' in content_type:
+                        # ✅ SAME FIX: Keep raw body and append single test param
                         try:
-                            body_dict = dict(parse_qsl(original_body_bytes.decode('utf-8', errors='ignore')))
-                        except Exception:
-                            body_dict = {}
-                        body_dict[param] = individual_marker
-                        confirm_data = urlencode(body_dict).encode('utf-8')
+                            original_body_str = original_body_bytes.decode('utf-8', errors='ignore')
+                        except:
+                            original_body_str = ""
+                        
+                        test_param = f"{quote(param, safe='')}={quote(individual_marker, safe='')}"
+                        
+                        if original_body_str:
+                            confirm_data = f"{original_body_str}&{test_param}".encode('utf-8')
+                        else:
+                            confirm_data = test_param.encode('utf-8')
                     
                     elif 'multipart/form-data' in content_type:
+                        confirm_body = original_body_bytes
                         pattern = re.compile(
                             b'(--[^\r\n]+\r\nContent-Disposition: form-data; name="' + re.escape(param.encode()) + b'".*?\r\n\r\n)'
                             b'(.*?)(?=\r\n--)',
                             re.DOTALL
                         )
-                        confirm_data = pattern.sub(b'\\1' + individual_marker.encode(), original_body_bytes, count=1)
-
+                        confirm_body = pattern.sub(b'\\1' + individual_marker.encode(), confirm_body, count=1)
+                        confirm_data = confirm_body
+                
                 confirm_response = await make_request_with_retries(
                     target_url=confirm_url,
                     headers=confirm_headers,
@@ -388,13 +687,23 @@ async def run_batched_discovery(full_url: str, method: str, headers: Dict, origi
                     method=method,
                     data=confirm_data
                 )
-                if confirm_response and html.unescape(confirm_response.text).count(individual_marker) > baseline_count:
-                    console_logger.info(f"      {C_GREEN}[+] Confirmed reflected parameter: {param}{C_END}")
-                    found_params.add(param)
+                
+                if confirm_response:
+                    confirm_text_unescaped = html.unescape(confirm_response.text)
+                    confirm_count = confirm_text_unescaped.count(individual_marker)
+                    
+                    if confirm_count > baseline_count:
+                        found_params.add(param)
+                        console_logger.info(f"      {C_GREEN}[+] Confirmed reflected parameter: {param}{C_END}")
         
         await asyncio.sleep(DELAY_BETWEEN_BATCHES)
-
+    
     return found_params
+
+
+
+
+
 
 
 
@@ -1028,12 +1337,198 @@ async def run_canary_global_reflection_test(base_url: str, headers: Dict, params
     
     return global_baseline, truly_reflected
 
+async def run_sequential_discovery(
+    full_url: str,
+    method: str,
+    headers: Dict,
+    original_body_bytes: bytes,
+    baseline_count: int,
+    params_to_test: List[str]
+) -> Set[str]:
+    """
+    ✅ FIXED: Handles both plain and encoded parameter names correctly
+    """
+    console_logger.info(
+        f"  {C_BLUE}[Sequential Discovery] Testing {len(params_to_test)} parameters individually...{C_END}"
+    )
+
+    parsed_url = urlparse(full_url)
+    base_path = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+    original_query_params = parse_qs(parsed_url.query, keep_blank_values=True)
+    
+    content_type = headers.get('Content-Type', headers.get('content-type', '')).lower()
+    
+    # Parse original body
+    original_body_str = ""
+    if method.upper() == "POST" and original_body_bytes:
+        try:
+            original_body_str = original_body_bytes.decode('utf-8', errors='ignore')
+        except Exception:
+            original_body_str = ""
+
+    reflected_params = set()
+
+    # ========================================
+    # ✅ Test each parameter INDIVIDUALLY
+    # ========================================
+    for idx, param in enumerate(params_to_test, 1):
+        await asyncio.sleep(DELAY_BETWEEN_CONFIRMATIONS)
+        
+        # Generate unique marker for THIS parameter
+        unique_marker = generate_random_string(12)
+        
+        console_logger.info(
+            f"    {C_YELLOW}[{idx}/{len(params_to_test)}] Testing parameter: {param} "
+            f"(marker: {unique_marker}){C_END}"
+        )
+
+        # ========================================
+        # Build request with ALL params preserved
+        # ========================================
+        test_query_params = original_query_params.copy()
+        test_data = None
+        test_headers = headers.copy()
+        test_headers.pop('Content-Length', None)
+        test_headers.pop('content-length', None)
+
+        # ✅ CRITICAL FIX: Check if param exists in query (both plain and encoded forms)
+        param_decoded = unquote(param)
+        param_in_query = (param in original_query_params) or (param_decoded in original_query_params)
+        param_in_body = False
+        
+        if method.upper() == "POST" and original_body_str:
+            # ✅ Check BOTH encoded and decoded forms in body
+            param_in_body = f"{param}=" in original_body_str or f"{param_decoded}=" in unquote(original_body_str)
+
+        # ========================================
+        # Build Query String
+        # ========================================
+        if param_in_query:
+            # ✅ Try both forms
+            if param in original_query_params:
+                test_query_params[param] = [unique_marker]
+            elif param_decoded in original_query_params:
+                test_query_params[param_decoded] = [unique_marker]
+        elif not param_in_body:
+            # Add to query (use decoded form for new params)
+            test_query_params[param_decoded] = [unique_marker]
+
+        test_url = f"{base_path}?{urlencode(test_query_params, doseq=True)}"
+
+        # ========================================
+        # Build POST Body (if POST request)
+        # ========================================
+        if method.upper() == "POST" and param_in_body:
+            if 'application/x-www-form-urlencoded' in content_type:
+                try:
+                    body_parts = []
+                    param_replaced = False
+
+                    # ✅ CRITICAL FIX: Match BOTH encoded and decoded forms
+                    for param_pair in original_body_str.split('&'):
+                        if not param_pair:
+                            continue
+
+                        if '=' not in param_pair:
+                            body_parts.append(param_pair)
+                            continue
+
+                        # Split on first '=' to preserve nested structures
+                        key_part, value_part = param_pair.split('=', 1)
+
+                        # ✅ Compare BOTH encoded and decoded forms
+                        key_decoded_check = unquote(key_part)
+                        
+                        if key_part == param or key_decoded_check == param or key_decoded_check == param_decoded:
+                            # ✅ Replace with marker (keep original encoding)
+                            body_parts.append(f"{key_part}={quote(unique_marker, safe='')}")
+                            param_replaced = True
+                            console_logger.debug(f"      [DEBUG] Replaced '{key_part}' with marker")
+                        else:
+                            # ✅ Keep ALL other params UNCHANGED
+                            body_parts.append(param_pair)
+
+                    if not param_replaced:
+                        # Param not found, add it (use encoded form if available)
+                        console_logger.debug(f"      [DEBUG] Parameter '{param}' not found in body, adding it")
+                        body_parts.append(f"{quote(param_decoded, safe='')}={quote(unique_marker, safe='')}")
+
+                    test_data = "&".join(body_parts).encode('utf-8')
+                    
+                    console_logger.debug(f"      [DEBUG] Final body length: {len(test_data)} bytes")
+
+                except Exception as e:
+                    console_logger.error(f"  [ERROR] Failed to build body for {param}: {e}")
+                    continue
+
+            elif 'multipart/form-data' in content_type:
+                # For multipart, try both forms
+                patched_body = original_body_bytes
+                
+                # Try encoded form first
+                pattern1 = re.compile(
+                    b'(--[^\r\n]+\r\nContent-Disposition: form-data; name="' + 
+                    re.escape(param.encode()) + b'".*?\r\n\r\n)'
+                    b'(.*?)(?=\r\n--)',
+                    re.DOTALL
+                )
+                patched_body = pattern1.sub(b'\\1' + unique_marker.encode(), patched_body, count=1)
+                
+                # Try decoded form if first didn't match
+                if patched_body == original_body_bytes:
+                    pattern2 = re.compile(
+                        b'(--[^\r\n]+\r\nContent-Disposition: form-data; name="' + 
+                        re.escape(param_decoded.encode()) + b'".*?\r\n\r\n)'
+                        b'(.*?)(?=\r\n--)',
+                        re.DOTALL
+                    )
+                    patched_body = pattern2.sub(b'\\1' + unique_marker.encode(), patched_body, count=1)
+                
+                test_data = patched_body
+
+        # ========================================
+        # Make Request
+        # ========================================
+        log_prefix = f"[Sequential Test {idx}/{len(params_to_test)} - {param}]"
+        
+        response = await make_request_with_retries(
+            target_url=test_url,
+            headers=test_headers,
+            log_prefix=log_prefix,
+            method=method,
+            data=test_data
+        )
+
+        if not response:
+            continue
+
+        # ========================================
+        # Check Reflection
+        # ========================================
+        response_text_unescaped = html.unescape(response.text)
+        reflection_count = response_text_unescaped.count(unique_marker)
+
+        if reflection_count > baseline_count:
+            console_logger.info(
+                f"      {C_GREEN}[✓ REFLECTED] Parameter '{param}' reflected "
+                f"{reflection_count} times (baseline: {baseline_count})!{C_END}"
+            )
+            reflected_params.add(param)
+        else:
+            console_logger.debug(
+                f"      {C_YELLOW}[✗] Parameter '{param}' NOT reflected "
+                f"({reflection_count} times, baseline: {baseline_count}){C_END}"
+            )
+
+    return reflected_params
+
 
 
 async def process_single_request(item: RequestItem):
     """
     Process a single request from Burp through all phases.
     ✅ FIXED: Preserves full URL including query strings for POST requests.
+    ✅ FIXED: Uses retry wrapper for Phase 2.1 and 2.2
     """
     parsed_url = urlparse(item.url)
     
@@ -1130,10 +1625,12 @@ async def process_single_request(item: RequestItem):
         console_logger.info(f"  {C_YELLOW}[Canary Test SKIP] Not enough parameters ({len(all_candidate_params)}/40 required). Using standard baseline.{C_END}")
         baseline_count = await establish_reflection_baseline(base_url, forwarded_headers)
 
-    # Phase 2.1: Test parameters found in the original request (URL + Body)
+    # ========== Phase 2.1: Test parameters found in the original request ==========
     if not all_reflected_params and params_from_request:
         console_logger.info(f"  {C_BLUE}[*] Phase 2.1: Testing {len(params_from_request)} parameters from original request: {', '.join(params_from_request)}{C_END}")
-        reflected_from_request = await run_batched_discovery(
+        
+        # ✅ CRITICAL FIX: Use retry wrapper instead of direct call
+        reflected_from_request = await run_batched_discovery_with_retry(
             full_url=item.url,
             method=item.method, 
             headers=forwarded_headers, 
@@ -1141,18 +1638,21 @@ async def process_single_request(item: RequestItem):
             baseline_count=baseline_count, 
             params_to_test=list(params_from_request)
         )
+        
         if reflected_from_request:
             console_logger.info(f"    {C_GREEN}[SUCCESS] Found {len(reflected_from_request)} reflected parameters from request: {', '.join(reflected_from_request)}{C_END}")
             all_reflected_params.update(reflected_from_request)
 
-    # Phase 2.2: Test combined params from wordlist and response scraping
+    # ========== Phase 2.2: Test combined params from wordlist and response ==========
     if not all_reflected_params:
         combined_secondary_params = set(PARAMS_TO_TEST).union(params_from_response)
         params_to_test_in_phase2_2 = [p for p in combined_secondary_params if p not in params_from_request]
 
         if params_to_test_in_phase2_2:
             console_logger.info(f"  {C_BLUE}[*] Phase 2.2: Testing {len(params_to_test_in_phase2_2)} combined params (wordlist + response)...{C_END}")
-            reflected_from_secondary = await run_batched_discovery(
+            
+            # ✅ CRITICAL FIX: Use retry wrapper instead of direct call
+            reflected_from_secondary = await run_batched_discovery_with_retry(
                 full_url=item.url,
                 method=item.method,
                 headers=forwarded_headers,
@@ -1160,6 +1660,7 @@ async def process_single_request(item: RequestItem):
                 baseline_count=baseline_count,
                 params_to_test=params_to_test_in_phase2_2
             )
+            
             if reflected_from_secondary:
                 console_logger.info(f"    {C_GREEN}[SUCCESS] Found {len(reflected_from_secondary)} reflected parameters from combined list: {', '.join(reflected_from_secondary)}{C_END}")
                 all_reflected_params.update(reflected_from_secondary)
@@ -1184,6 +1685,7 @@ async def process_single_request(item: RequestItem):
         for param in sorted(list(all_reflected_params))
     ]
     await asyncio.gather(*analysis_tasks)
+
 
 
 
