@@ -1018,31 +1018,33 @@ async def run_post_character_probe_with_body(
                         
                         # Decode ONLY the key for comparison
                         try:
-                            key_decoded = unquote(key_encoded)
+                            key_decoded = unquote(key_encoded, errors='ignore')
                         except Exception:
                             key_decoded = key_encoded
                         
                         if key_decoded == param:
                             # ✅ Found our target parameter!
                             param_found = True
-                            if encoding_name == 'raw':
-                                # RAW: Keep key encoded, value unencoded
-                                body_parts.append(f"{key_encoded}={payload_value}")
-                                console_logger.debug(f"  [DEBUG] RAW mode: {key_encoded}={payload_value}")
-                            else:
-                                # Other encodings: Keep key encoded, URL-encode value
-                                body_parts.append(f"{key_encoded}={quote(payload_value, safe='')}")
-                                console_logger.debug(f"  [DEBUG] Encoded mode: {key_encoded}={quote(payload_value, safe='')}")
+                            # ALWAYS use the original encoded key
+                            final_key = key_encoded
+                            # Encode the payload value appropriately
+                            final_value = quote(payload_value, safe='')
+
+                            body_parts.append(f"{final_key}={final_value}")
+                            console_logger.debug(f"  [DEBUG] Replaced '{key_decoded}' with payload.")
+
                         else:
                             # Keep original parameter untouched
                             body_parts.append(param_pair)
                     
                     if not param_found:
                         # Parameter not in body, add it
-                        if encoding_name == 'raw':
-                            body_parts.append(f"{quote(param, safe='')}={payload_value}")
-                        else:
-                            body_parts.append(f"{quote(param, safe='')}={quote(payload_value, safe='')}")
+                        # a new parameter should be fully encoded
+                        final_key = quote(param, safe='')
+                        final_value = quote(payload_value, safe='')
+                        body_parts.append(f"{final_key}={final_value}")
+                        console_logger.debug(f"  [DEBUG] Added new param '{param}' with payload.")
+
                     
                     post_data = '&'.join(body_parts).encode('utf-8')
                     console_logger.debug(f"  [DEBUG] Final body (first 300 chars): {post_data[:300]}")
@@ -1050,16 +1052,10 @@ async def run_post_character_probe_with_body(
                 except Exception as e:
                     console_logger.debug(f"    [DEBUG] Failed to parse body: {e}. Using fallback.")
                     # Fallback: simple encoding
-                    if encoding_name == 'raw':
-                        post_data = f"{param}={payload_value}".encode('utf-8')
-                    else:
-                        post_data = urlencode({param: payload_value}).encode("utf-8")
+                    post_data = urlencode({param: payload_value}).encode("utf-8")
             else:
                 # No original body, create simple param
-                if encoding_name == 'raw':
-                    post_data = f"{quote(param, safe='')}={payload_value}".encode('utf-8')
-                else:
-                    post_data = urlencode({param: payload_value}).encode("utf-8")
+                post_data = urlencode({param: payload_value}).encode("utf-8")
                 post_headers["Content-Type"] = "application/x-www-form-urlencoded"
 
             log_prefix = f"[Phase 3/4 POST-urlencoded - {param} - '{char}' - {encoding_name}]"
@@ -1625,45 +1621,22 @@ async def process_single_request(item: RequestItem):
         console_logger.info(f"  {C_YELLOW}[Canary Test SKIP] Not enough parameters ({len(all_candidate_params)}/40 required). Using standard baseline.{C_END}")
         baseline_count = await establish_reflection_baseline(base_url, forwarded_headers)
 
-    # ========== Phase 2.1: Test parameters found in the original request ==========
-    if not all_reflected_params and params_from_request:
-        console_logger.info(f"  {C_BLUE}[*] Phase 2.1: Testing {len(params_from_request)} parameters from original request: {', '.join(params_from_request)}{C_END}")
+    # ========== Phase 2: Test ALL candidate parameters sequentially ==========
+    if not all_reflected_params:
+        console_logger.info(f"  {C_BLUE}[*] Phase 2: Sequentially testing all {len(all_candidate_params)} candidate parameters...{C_END}")
         
-        # ✅ CRITICAL FIX: Use retry wrapper instead of direct call
-        reflected_from_request = await run_batched_discovery_with_retry(
+        # Use the more reliable sequential discovery method
+        all_reflected_params = await run_sequential_discovery(
             full_url=item.url,
-            method=item.method, 
-            headers=forwarded_headers, 
-            original_body_bytes=item.body, 
-            baseline_count=baseline_count, 
-            params_to_test=list(params_from_request)
+            method=item.method,
+            headers=forwarded_headers,
+            original_body_bytes=item.body,
+            baseline_count=baseline_count,
+            params_to_test=all_candidate_params
         )
         
-        if reflected_from_request:
-            console_logger.info(f"    {C_GREEN}[SUCCESS] Found {len(reflected_from_request)} reflected parameters from request: {', '.join(reflected_from_request)}{C_END}")
-            all_reflected_params.update(reflected_from_request)
-
-    # ========== Phase 2.2: Test combined params from wordlist and response ==========
-    if not all_reflected_params:
-        combined_secondary_params = set(PARAMS_TO_TEST).union(params_from_response)
-        params_to_test_in_phase2_2 = [p for p in combined_secondary_params if p not in params_from_request]
-
-        if params_to_test_in_phase2_2:
-            console_logger.info(f"  {C_BLUE}[*] Phase 2.2: Testing {len(params_to_test_in_phase2_2)} combined params (wordlist + response)...{C_END}")
-            
-            # ✅ CRITICAL FIX: Use retry wrapper instead of direct call
-            reflected_from_secondary = await run_batched_discovery_with_retry(
-                full_url=item.url,
-                method=item.method,
-                headers=forwarded_headers,
-                original_body_bytes=item.body,
-                baseline_count=baseline_count,
-                params_to_test=params_to_test_in_phase2_2
-            )
-            
-            if reflected_from_secondary:
-                console_logger.info(f"    {C_GREEN}[SUCCESS] Found {len(reflected_from_secondary)} reflected parameters from combined list: {', '.join(reflected_from_secondary)}{C_END}")
-                all_reflected_params.update(reflected_from_secondary)
+        if all_reflected_params:
+            console_logger.info(f"    {C_GREEN}[SUCCESS] Found {len(all_reflected_params)} reflected parameters: {', '.join(sorted(list(all_reflected_params)))}{C_END}")
 
     # Final Check and Continuation
     if not all_reflected_params:
