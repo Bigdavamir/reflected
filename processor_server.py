@@ -1382,7 +1382,9 @@ async def run_sequential_discovery(
         # Build request with ALL params preserved
         # ========================================
         test_query_params = original_query_params.copy()
-        test_data = None
+        # ✅ CRITICAL FIX: Always start with the original body.
+        # This ensures that when we test a query parameter, the POST body is not dropped.
+        test_data = original_body_bytes
         test_headers = headers.copy()
         test_headers.pop('Content-Length', None)
         test_headers.pop('content-length', None)
@@ -1546,10 +1548,11 @@ async def process_single_request(item: RequestItem):
                 for param_pair in body_str.split('&'):
                     if '=' in param_pair:
                         key = param_pair.split('=', 1)[0]
-                        # We add the RAW, undecoded key to preserve its exact structure.
-                        # The discovery functions are designed to handle both raw and
-                        # decoded forms for matching.
-                        params_from_request_keys.add(key)
+                        # We now add the DECODED key, so it can be consistently
+                        # matched by the testing functions, which expect decoded names.
+                        # The functions that reconstruct the request are already
+                        # designed to handle re-encoding the parameter correctly.
+                        params_from_request_keys.add(unquote(key))
             except Exception as e:
                 console_logger.error(f"    {C_RED}[!] Error parsing urlencoded POST body: {e}{C_END}")
         
